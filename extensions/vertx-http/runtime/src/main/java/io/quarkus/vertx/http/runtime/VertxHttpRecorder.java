@@ -46,6 +46,7 @@ import io.vertx.core.Handler;
 import io.vertx.core.Verticle;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.ClientAuth;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerRequest;
@@ -55,6 +56,7 @@ import io.vertx.core.impl.VertxInternal;
 import io.vertx.core.json.JsonObject;
 import io.vertx.core.net.JksOptions;
 import io.vertx.core.net.PemKeyCertOptions;
+import io.vertx.core.net.PemTrustOptions;
 import io.vertx.core.net.PfxOptions;
 import io.vertx.core.net.impl.VertxHandler;
 import io.vertx.ext.web.Route;
@@ -285,37 +287,72 @@ public class VertxHttpRecorder {
     }
 
     /**
+     * Get the key/certificate file type.
+     * 
+     * @param configuredType the optional configured type string.
+     * @param filePath the path to the key/certificate file.
+     * @return the type name, i.e. "pkcs12", "jks" or "pem".
+     */
+    private static String getFileType(Optional<String> configuredType, Path filePath) {
+        String type;
+        if (configuredType.isPresent()) {
+            type = configuredType.get().toLowerCase();
+        } else {
+            final String pathName = filePath.toString().toLowerCase();
+            if (pathName.endsWith(".p12") || pathName.endsWith(".pkcs12") || pathName.endsWith(".pfx")) {
+                type = "pkcs12";
+            } else if (pathName.endsWith(".pem")) {
+                type = "pem";
+            } else {
+                // assume jks as default
+                type = "jks";
+            }
+        }
+        return type;
+    }
+
+    /**
      * Get an {@code HttpServerOptions} for this server configuration, or null if SSL should not be enabled
      */
     private static HttpServerOptions createSslOptions(HttpConfiguration httpConfiguration, LaunchMode launchMode)
             throws IOException {
+        final HttpServerOptions serverOptions = new HttpServerOptions();
+
+        serverOptions.setMaxHeaderSize(httpConfiguration.limits.maxHeaderSize.asBigInteger().intValueExact());
+
         ServerSslConfig sslConfig = httpConfiguration.ssl;
-        //TODO: static fields break config
+
+        if (setSslServerConfig(serverOptions, sslConfig)) {
+            // only proceed with this if SSL/TLS was actually enabled
+            setSslClientAuthConfig(serverOptions, sslConfig.clientAuth);
+
+            serverOptions.setSsl(true);
+            serverOptions.setHost(httpConfiguration.host);
+            serverOptions.setPort(httpConfiguration.determineSslPort(launchMode));
+        }
+
+        return serverOptions;
+    }
+
+    /**
+     * Enable SSL/TLS configuration if configured.
+     * 
+     * @param serverOptions the server options where to enable SSL/TLS.
+     * @param sslConfig the SSL/TLS configuration.
+     * @return true if SSL/TLS was enabled. false, if no SSL/TLS.
+     * @throws IOException if reading a configured key fails.
+     */
+    private static boolean setSslServerConfig(HttpServerOptions serverOptions, ServerSslConfig sslConfig) throws IOException {
         final Optional<Path> certFile = sslConfig.certificate.file;
         final Optional<Path> keyFile = sslConfig.certificate.keyFile;
         final Optional<Path> keyStoreFile = sslConfig.certificate.keyStoreFile;
         final String keystorePassword = sslConfig.certificate.keyStorePassword;
-        final HttpServerOptions serverOptions = new HttpServerOptions();
-        serverOptions.setMaxHeaderSize(httpConfiguration.limits.maxHeaderSize.asBigInteger().intValueExact());
-        setIdleTimeout(httpConfiguration, serverOptions);
 
         if (certFile.isPresent() && keyFile.isPresent()) {
             createPemKeyCertOptions(certFile.get(), keyFile.get(), serverOptions);
         } else if (keyStoreFile.isPresent()) {
             final Path keyStorePath = keyStoreFile.get();
-            final Optional<String> keyStoreFileType = sslConfig.certificate.keyStoreFileType;
-            final String type;
-            if (keyStoreFileType.isPresent()) {
-                type = keyStoreFileType.get().toLowerCase();
-            } else {
-                final String pathName = keyStorePath.toString();
-                if (pathName.endsWith(".p12") || pathName.endsWith(".pkcs12") || pathName.endsWith(".pfx")) {
-                    type = "pkcs12";
-                } else {
-                    // assume jks
-                    type = "jks";
-                }
-            }
+            final String type = getFileType(sslConfig.certificate.keyStoreFileType, keyStorePath);
 
             byte[] data = getFileContent(keyStorePath);
             switch (type) {
@@ -337,9 +374,9 @@ public class VertxHttpRecorder {
                     throw new IllegalArgumentException(
                             "Unknown keystore type: " + type + " valid types are jks or pkcs12");
             }
-
         } else {
-            return null;
+            // neither PEM keys nor keystore was configured, thus SSL/TLS is not enabled
+            return false;
         }
 
         for (String cipher : sslConfig.cipherSuites) {
@@ -353,10 +390,56 @@ public class VertxHttpRecorder {
                 serverOptions.addEnabledSecureTransportProtocol(protocol);
             }
         }
-        serverOptions.setSsl(true);
-        serverOptions.setHost(httpConfiguration.host);
-        serverOptions.setPort(httpConfiguration.determineSslPort(launchMode));
-        return serverOptions;
+        return true;
+    }
+
+    /**
+     * Enable SSL/TLS client authentication if configured.
+     * This makes only sense, if SSL/TLS server is enabled.
+     * 
+     * @param serverOptions the server options where to enable SSL/TLS client authentication.
+     * @param clientAuthConfig the SSL/TLS client authentication configuration.
+     * @throws IOException if reading a configured key fails.
+     */
+    private static void setSslClientAuthConfig(HttpServerOptions serverOptions, ClientAuthConfig clientAuthConfig)
+            throws IOException {
+        final Optional<ClientAuth> clientAuth = clientAuthConfig.type;
+        if (clientAuth.isPresent()) {
+            serverOptions.setClientAuth(clientAuth.get());
+        }
+        Optional<Path> trustStoreFile = clientAuthConfig.trustStoreFile;
+        if (trustStoreFile.isPresent()) {
+            final Path trustStorePath = trustStoreFile.get();
+            final String truststorePassword = clientAuthConfig.trustStorePassword;
+            final String type = getFileType(clientAuthConfig.trustStoreFileType, trustStorePath);
+
+            byte[] data = getFileContent(trustStorePath);
+            switch (type) {
+                case "pkcs12": {
+                    PfxOptions options = new PfxOptions()
+                            .setPassword(truststorePassword)
+                            .setValue(Buffer.buffer(data));
+                    serverOptions.setPfxTrustOptions(options);
+                    break;
+                }
+                case "jks": {
+                    JksOptions options = new JksOptions()
+                            .setPassword(truststorePassword)
+                            .setValue(Buffer.buffer(data));
+                    serverOptions.setTrustStoreOptions(options);
+                    break;
+                }
+                case "pem": {
+                    PemTrustOptions options = new PemTrustOptions()
+                            .addCertValue(Buffer.buffer(data));
+                    serverOptions.setPemTrustOptions(options);
+                    break;
+                }
+                default:
+                    throw new IllegalArgumentException(
+                            "Unknown truststore type: " + type + " valid types are jks or pkcs12");
+            }
+        }
     }
 
     private static byte[] getFileContent(Path path) throws IOException {

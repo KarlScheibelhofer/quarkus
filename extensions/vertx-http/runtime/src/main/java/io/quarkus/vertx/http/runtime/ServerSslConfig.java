@@ -29,4 +29,10 @@ public class ServerSslConfig {
     @ConfigItem(defaultValue = "TLSv1.3,TLSv1.2")
     public List<String> protocols;
 
+    /**
+     * The (all optional) SSL/TLS client authentication configuration.
+     */
+    @ConfigItem
+    public ClientAuthConfig clientAuth;
+
 }
